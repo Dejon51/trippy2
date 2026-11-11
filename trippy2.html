@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trippy2</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #000; }
+  canvas {
+    display: block;
+    width: 100vw;
+    height: 100vh;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+  }
+</style>
+</head>
+<body>
+<canvas id="bg"></canvas>
+<script>
+(() => {
+  const canvas = document.getElementById('bg');
+  const ctx = canvas.getContext('2d');
+
+  // ============ Config (same look & motion as before) ============
+  const PIXEL_SIZE  = 5;
+  const SCALE       = 0.028;
+  const SPIN_SPEED  = 0.000025;
+  const FLOW_SPEED  = 0.000012;
+  const HUE_SPEED   = 0.00075;
+  const DRIFT_SPEED = 0.000020;
+  const DRIFT_SCALE = 1.2;
+  const DRIFT_FREQ  = 0.35;
+  const CONTRAST    = 1.8;
+  const MID         = 0.5;
+  const WARP_OCT    = 2;      // was 3
+  const FINAL_OCT   = 4;      // was 5
+  const V_BITS      = 9;      // 512 v-levels for smooth dithering
+  const V_LEVELS    = 1 << V_BITS;
+  const V_MASK      = V_LEVELS - 1;
+  const FRAME_MS    = 32;     // ~30 fps target
+
+  // 3-3-2 channel levels (8 / 8 / 4)
+  const MR = 7, MG = 7, MB = 3;
+
+  // ============ Bayer 8×8 ============
+  function bayer(n) {
+    if (n === 1) return [[0]];
+    const h = n / 2, p = bayer(h);
+    const out = Array.from({ length: n }, () => new Array(n).fill(0));
+    for (let y = 0; y < h; y++) for (let x = 0; x < h; x++) {
+      const v = p[y][x] * 4;
+      out[y][x] = v; out[y][x + h] = v + 2;
+      out[y + h][x] = v + 3; out[y + h][x + h] = v + 1;
+    }
+    return out;
+  }
+  const MATRIX = bayer(8);
+  const THRESH = new Float32Array(64);
+  for (let y = 0; y < 8; y++)
+    for (let x = 0; x < 8; x++)
+      THRESH[(y << 3) | x] = (MATRIX[y][x] + 0.5) / 64;
+
+  // ============ Perlin noise ============
+  const perm = new Uint8Array(512);
+  const grad3 = [
+    [1,1,0],[-1,1,0],[1,-1,0],[-1,-1,0],
+    [1,0,1],[-1,0,1],[1,0,-1],[-1,0,-1],
+    [0,1,1],[0,-1,1],[0,1,-1],[0,-1,-1],
+  ];
+  (() => {
+    const p = new Uint8Array(256);
+    for (let i = 0; i < 256; i++) p[i] = i;
+    let seed = 1337;
+    const rnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296;
+    for (let i = 255; i > 0; i--) {
+      const j = Math.floor(rnd() * (i + 1));
+      const tmp = p[i]; p[i] = p[j]; p[j] = tmp;
+    }
+    for (let i = 0; i < 512; i++) perm[i] = p[i & 255];
+  })();
+
+  // Precompute gradient table indexed directly by permutation value (no % 12)
+  const grad12 = new Array(256);
+  for (let i = 0; i < 256; i++) grad12[i] = grad3[i % 12];
+
+  function noise3(x, y, z) {
+    const fx = Math.floor(x), fy = Math.floor(y), fz = Math.floor(z);
+    const X = fx & 255, Y = fy & 255, Z = fz & 255;
+    x -= fx; y -= fy; z -= fz;
+    const u = x*x*x*(x*(x*6 - 15) + 10);
+    const v = y*y*y*(y*(y*6 - 15) + 10);
+    const w = z*z*z*(z*(z*6 - 15) + 10);
+    const A  = perm[X]   + Y, AA = perm[A]   + Z, AB = perm[A + 1] + Z;
+    const B  = perm[X+1] + Y, BA = perm[B]   + Z, BB = perm[B + 1] + Z;
+    const gAA = grad12[perm[AA]],     gBA = grad12[perm[BA]];
+    const gAB = grad12[perm[AB]],     gBB = grad12[perm[BB]];
+    const gAA1 = grad12[perm[AA+1]],  gBA1 = grad12[perm[BA+1]];
+    const gAB1 = grad12[perm[AB+1]],  gBB1 = grad12[perm[BB+1]];
+    const x1 = x - 1, y1 = y - 1, z1 = z - 1;
+    const n000 = gAA[0]*x  + gAA[1]*y  + gAA[2]*z;
+    const n100 = gBA[0]*x1 + gBA[1]*y  + gBA[2]*z;
+    const n010 = gAB[0]*x  + gAB[1]*y1 + gAB[2]*z;
+    const n110 = gBB[0]*x1 + gBB[1]*y1 + gBB[2]*z;
+    const n001 = gAA1[0]*x  + gAA1[1]*y  + gAA1[2]*z1;
+    const n101 = gBA1[0]*x1 + gBA1[1]*y  + gBA1[2]*z1;
+    const n011 = gAB1[0]*x  + gAB1[1]*y1 + gAB1[2]*z1;
+    const n111 = gBB1[0]*x1 + gBB1[1]*y1 + gBB1[2]*z1;
+    const nx00 = n000 + (n100 - n000) * u;
+    const nx10 = n010 + (n110 - n010) * u;
+    const nx01 = n001 + (n101 - n001) * u;
+    const nx11 = n011 + (n111 - n011) * u;
+    const nxy0 = nx00 + (nx10 - nx00) * v;
+    const nxy1 = nx01 + (nx11 - nx01) * v;
+    return nxy0 + (nxy1 - nxy0) * w;
+  }
+
+  function fbm(x, y, z, oct) {
+    let sum = 0, amp = 0.5, freq = 1, norm = 0;
+    for (let i = 0; i < oct; i++) {
+      sum  += noise3(x * freq, y * freq, z * freq) * amp;
+      norm += amp; freq *= 2; amp *= 0.5;
+    }
+    return (sum / norm) * 0.5 + 0.5;
+  }
+
+  // ============ HSL helpers ============
+  function rgbToHsl(r, g, b) {
+    r /= 255; g /= 255; b /= 255;
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    let h = 0, s = 0, l = (max + min) / 2;
+    if (max !== min) {
+      const d = max - min;
+      s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+      switch (max) {
+        case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+        case g: h = (b - r) / d + 2; break;
+        case b: h = (r - g) / d + 4; break;
+      }
+      h /= 6;
+    }
+    return [h * 360, s * 100, l * 100];
+  }
+  function hslToRgb(h, s, l) {
+    h = ((h % 360) + 360) % 360 / 360; s /= 100; l /= 100;
+    if (s === 0) { const v = l * 255; return [v, v, v]; }
+    const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+    const p = 2 * l - q;
+    const h2r = (pp, qq, t) => {
+      if (t < 0) t += 1; if (t > 1) t -= 1;
+      if (t < 1/6) return pp + (qq - pp) * 6 * t;
+      if (t < 1/2) return qq;
+      if (t < 2/3) return pp + (qq - pp) * (2/3 - t) * 6;
+      return pp;
+    };
+    return [h2r(p, q, h + 1/3) * 255, h2r(p, q, h) * 255, h2r(p, q, h - 1/3) * 255];
+  }
+
+  // ============ Palette ============
+  const BASE_STOPS = [
+    [0.00,  30,   8,  70],
+    [0.20, 120,  20, 180],
+    [0.40, 230,  50, 180],
+    [0.55,  80, 200, 230],
+    [0.75, 255, 220,  90],
+    [1.00, 255, 100,  40],
+  ];
+  const STOPS = BASE_STOPS.map(s => s.slice());
+
+  function rotatePalette(hueDeg) {
+    for (let i = 0; i < BASE_STOPS.length; i++) {
+      const s = BASE_STOPS[i];
+      const hsl = rgbToHsl(s[1], s[2], s[3]);
+      const rgb = hslToRgb(hsl[0] + hueDeg, hsl[1], hsl[2]);
+      STOPS[i][1] = rgb[0]; STOPS[i][2] = rgb[1]; STOPS[i][3] = rgb[2];
+    }
+  }
+  function paletteSample(t) {
+    if (t <= 0) return [STOPS[0][1], STOPS[0][2], STOPS[0][3]];
+    if (t >= 1) { const e = STOPS[STOPS.length - 1]; return [e[1], e[2], e[3]]; }
+    for (let i = 0; i < STOPS.length - 1; i++) {
+      const a = STOPS[i], b = STOPS[i + 1];
+      if (t >= a[0] && t <= b[0]) {
+        const f = (t - a[0]) / (b[0] - a[0]);
+        return [a[1] + (b[1] - a[1]) * f, a[2] + (b[2] - a[2]) * f, a[3] + (b[3] - a[3]) * f];
+      }
+    }
+    const e = STOPS[STOPS.length - 1];
+    return [e[1], e[2], e[3]];
+  }
+
+  // ============ Packed color LUT ============
+  const LE = new Uint8Array(new Uint32Array([1]).buffer)[0] === 1;
+  const pack = LE
+    ? (r, g, b) => (0xff000000 | (b << 16) | (g << 8) | r) >>> 0
+    : (r, g, b) => ((r << 24) | (g << 16) | (b << 8) | 0xff) >>> 0;
+
+  // Precomputed output channel values (avoids divisions inside rebuild)
+  const R_OUT = new Uint8Array(MR + 1);
+  const G_OUT = new Uint8Array(MG + 1);
+  const B_OUT = new Uint8Array(MB + 1);
+  for (let i = 0; i <= MR; i++) R_OUT[i] = (i / MR) * 255 | 0;
+  for (let i = 0; i <= MG; i++) G_OUT[i] = (i / MG) * 255 | 0;
+  for (let i = 0; i <= MB; i++) B_OUT[i] = (i / MB) * 255 | 0;
+
+  const LUT32 = new Uint32Array(V_LEVELS * 64);
+
+  function rebuildLUT(hueDeg) {
+    rotatePalette(hueDeg);
+    for (let vi = 0; vi < V_LEVELS; vi++) {
+      const v = vi / V_MASK;
+      const [r, g, b] = paletteSample(v);
+      const vr = (r / 255) * MR, vg = (g / 255) * MG, vb = (b / 255) * MB;
+      const rl = vr | 0, gl = vg | 0, bl = vb | 0;
+      const rf = vr - rl, gf = vg - gl, bf = vb - bl;
+      const base = vi << 6;
+      for (let th = 0; th < 64; th++) {
+        const t = THRESH[th];
+        let qr = rf > t ? rl + 1 : rl; if (qr > MR) qr = MR;
+        let qg = gf > t ? gl + 1 : gl; if (qg > MG) qg = MG;
+        let qb = bf > t ? bl + 1 : bl; if (qb > MB) qb = MB;
+        LUT32[base | th] = pack(R_OUT[qr], G_OUT[qg], B_OUT[qb]);
+      }
+    }
+  }
+
+  // ============ Reusable buffers ============
+  let imageData = null, buf32 = null;
+  let dxCos = null, dxSin = null;
+  let lastW = 0, lastH = 0;
+
+  function ensureBuffers(w, h) {
+    if (w === lastW && h === lastH) return;
+    canvas.width = w; canvas.height = h;
+    imageData = ctx.createImageData(w, h);
+    buf32 = new Uint32Array(imageData.data.buffer);
+    dxCos = new Float32Array(w);
+    dxSin = new Float32Array(w);
+    lastW = w; lastH = h;
+  }
+
+  // ============ Render loop ============
+  const start = performance.now();
+  let prev = 0;
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    if (now - prev < FRAME_MS) return;
+    prev = now;
+
+    const elapsed = now - start;
+    const tSpin  = elapsed * SPIN_SPEED;
+    const tFlow  = elapsed * FLOW_SPEED;
+    const tHue   = elapsed * HUE_SPEED;
+    const tDrift = elapsed * DRIFT_SPEED;
+
+    rebuildLUT(tHue);
+
+    const w = Math.ceil(window.innerWidth  / PIXEL_SIZE);
+    const h = Math.ceil(window.innerHeight / PIXEL_SIZE);
+    ensureBuffers(w, h);
+
+    // Camera drift (2 slow noise samples, once per frame)
+    const driftX = (noise3(tDrift * DRIFT_FREQ,        0.5, 7.3) - 0.5) * 2 * DRIFT_SCALE;
+    const driftY = (noise3(tDrift * DRIFT_FREQ + 41.7, 0.5, 3.1) - 0.5) * 2 * DRIFT_SCALE;
+
+    // Rotation: fold SCALE into cos/sin so per-pixel math is 1 add
+    const cx = w * 0.5, cy = h * 0.5;
+    const cosT = Math.cos(tSpin), sinT = Math.sin(tSpin);
+    const cosS = cosT * SCALE, sinS = sinT * SCALE;
+
+    // Pre-compute dx·cosS and dx·sinS once per frame
+    for (let x = 0; x < w; x++) {
+      const dx = x - cx;
+      dxCos[x] = dx * cosS;
+      dxSin[x] = dx * sinS;
+    }
+
+    for (let y = 0; y < h; y++) {
+      const dy = y - cy;
+      const rowA = driftX - dy * sinS;   // constant across the row
+      const rowB = driftY + dy * cosS;
+      const rowBase = (y & 7) << 3;      // Bayer row offset (0,8,16…56)
+      const rowOff  = y * w;
+
+      for (let x = 0; x < w; x++) {
+        const nx = dxCos[x] + rowA;
+        const ny = dxSin[x] + rowB;
+
+        const wx = fbm(nx + 11.3, ny +  7.1, tFlow, WARP_OCT);
+        const wy = fbm(nx + 31.7, ny + 22.9, tFlow, WARP_OCT);
+
+        let v = fbm(nx + wx * 5, ny + wy * 5, tFlow * 2, FINAL_OCT);
+        v = (v - MID) * CONTRAST + MID;
+        if (v < 0) v = 0; else if (v > 1) v = 1;
+
+        const vIdx = (v * V_MASK) | 0;
+        const tIdx = rowBase | (x & 7);
+        buf32[rowOff + x] = LUT32[(vIdx << 6) | tIdx];
+      }
+    }
+
+    ctx.putImageData(imageData, 0, 0);
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
